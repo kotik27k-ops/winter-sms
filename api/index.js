@@ -5,9 +5,9 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const BOT_USER = process.env.BOT_USER;
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
 
 const cors = {
   'Access-Control-Allow-Origin': ALLOW_ORIGIN,
@@ -31,77 +31,75 @@ async function tg(chat, text) {
 export default async function handler(req) {
   const url = new URL(req.url);
 
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: cors });
-  }
+  if (req.method === 'OPTIONS') return new Response(null, { headers: cors });
 
+  // 1. Telegram webhook
   if (req.method === 'POST' && url.pathname.endsWith('/hook')) {
     let up;
     try { up = await req.json(); } catch { return new Response('ok'); }
+    
     const msg = up.message;
     if (!msg || !msg.text) return new Response('ok');
+    
     const chat = msg.chat.id;
-    const m = /^\/start\s+(\S+)/.exec(msg.text);
-    if (!m) {
-      await tg(chat, 'Вернитесь на сайт Winter и нажмите «Получить код» — я пришлю 6 цифр.');
+    const text = msg.text.trim();
+
+    if (text === '/start') {
+      await tg(chat, '👋 Привет!\n\nПришлите ваш @username из Winter (без символа @), чтобы привязать аккаунт.\n\nНапример: kotik');
       return new Response('ok');
     }
-    const sid = m[1];
-    const raw = await redis.get('sid:' + sid);
-    if (!raw) {
-      await tg(chat, 'Ссылка устарела. Запросите код на сайте заново.');
+
+    if (text === '/reset') {
+      const rec = await redis.get('user:' + chat);
+      if (rec) {
+        await redis.del('user:' + chat);
+        await redis.del('tg:' + rec.username);
+        await tg(chat, '✅ Привязка сброшена. Напишите /start, чтобы привязать новый аккаунт.');
+      } else {
+        await tg(chat, 'У вас нет привязанного аккаунта.');
+      }
       return new Response('ok');
     }
-    const code = String(100000 + Math.floor(Math.random() * 900000));
-    await redis.set('otp:' + sid, JSON.stringify({ code, chat, tries: 0 }), { ex: 300 });
-    await redis.set('sid:' + sid, JSON.stringify({ ready: 1 }), { ex: 300 });
-    await tg(chat, '🔐 Код входа в Winter\n\n' + code + '\n\nДействует 5 минут. Никому не сообщайте.');
+
+    // Проверяем, не привязан ли уже этот Telegram
+    const existing = await redis.get('user:' + chat);
+    if (existing) {
+      await tg(chat, `⚠️ Ваш Telegram уже привязан к @${existing.username}.\n\nЧтобы перепривязать — напишите /reset`);
+      return new Response('ok');
+    }
+
+    // Сохраняем связь
+    const username = text.replace(/^@/, '').toLowerCase();
+    if (!/^[a-z0-9_]{3,32}$/.test(username)) {
+      await tg(chat, '❌ Неверный формат. Напишите только буквы, цифры и _ (3-32 символа), без @.');
+      return new Response('ok');
+    }
+
+    await redis.set('user:' + chat, { username, chat, ts: Date.now() });
+    await redis.set('tg:' + username, { chat, username, ts: Date.now() });
+    await tg(chat, `✅ Готово! Аккаунт @${username} успешно привязан к этому Telegram.`);
     return new Response('ok');
   }
 
-  if (req.method !== 'POST') return j({ error: 'POST only' }, 405);
-  let body;
-  try { body = await req.json(); } catch { return j({ error: 'bad json' }, 400); }
-
-  if (url.pathname.endsWith('/send')) {
-    const phone = String(body.phone || '');
-    if (!/^\+[1-9]\d{7,14}$/.test(phone)) return j({ error: 'Неверный номер' }, 400);
-    const rl = await redis.get('rl:' + phone);
-    const now = Date.now();
-    if (rl && now - rl < 30000) return j({ error: 'Подождите 30 секунд' }, 429);
-    await redis.set('rl:' + phone, now, { ex: 60 });
-    const id = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
-    await redis.set('sid:' + id, JSON.stringify({ phone, ready: 0 }), { ex: 300 });
-    return j({ id, ttl: 300, link: `https://t.me/${BOT_USER}?start=${id}` });
+  // 2. Проверка привязки по username (для сайта)
+  if (url.pathname.endsWith('/check') && req.method === 'POST') {
+    let body;
+    try { body = await req.json(); } catch { return j({ error: 'bad json' }, 400); }
+    const username = String(body.username || '').replace(/^@/, '').toLowerCase();
+    const rec = await redis.get('tg:' + username);
+    return j({ linked: !!rec, chat: rec ? rec.chat : null });
   }
 
-  if (url.pathname.endsWith('/ready')) {
-    const raw = await redis.get('sid:' + String(body.id || ''));
-    return j({ ready: !!(raw && JSON.parse(raw).ready) });
+  // 3. Проверка привязки по chat_id (для сайта)
+  if (url.pathname.endsWith('/me') && req.method === 'POST') {
+    let body;
+    try { body = await req.json(); } catch { return j({ error: 'bad json' }, 400); }
+    const chat = body.chat;
+    const rec = await redis.get('user:' + chat);
+    return j({ linked: !!rec, username: rec ? rec.username : null });
   }
 
-  if (url.pathname.endsWith('/verify')) {
-    const id = String(body.id || '');
-    const code = String(body.code || '');
-    const raw = await redis.get('otp:' + id);
-    if (!raw) return j({ ok: false, error: 'Код не выдан. Откройте бота и нажмите Start.' }, 400);
-    const rec = JSON.parse(raw);
-    if ((rec.tries || 0) >= 5) {
-      await redis.del('otp:' + id);
-      return j({ ok: false, error: 'Слишком много попыток' }, 429);
-    }
-    if (rec.code !== code) {
-      await redis.set('otp:' + id, JSON.stringify({ ...rec, tries: (rec.tries || 0) + 1 }), { ex: 300 });
-      return j({ ok: false, error: 'Неверный код' }, 400);
-    }
-    await redis.del('otp:' + id);
-    await redis.del('sid:' + id);
-    return j({ ok: true });
-  }
-
-  return j({ error: 'not found' }, 404);
+  return j({ error: 'POST only' }, 405);
 }
 
-export const config = {
-  runtime: 'edge',
-};
+export const config = { runtime: 'edge' };
